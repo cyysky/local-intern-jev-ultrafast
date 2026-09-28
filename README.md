@@ -57,7 +57,7 @@ git clone https://github.com/browser-use/jev-ultrafast.git
 cd jev-ultrafast
 uv sync
 cp .env.example .env
-# Add TYPESAFE_API_KEY and TEXT_MODEL_API_KEY.
+# Add TYPESAFE_API_KEY and TEXT_MODEL_API_KEY, or point the base URLs at local servers.
 uv run jev
 ```
 
@@ -66,6 +66,10 @@ Open **http://127.0.0.1:8766** and click **Start demo → Run automatically**. T
 Chrome connects through [Browser Harness](https://github.com/browser-use/browser-harness), installed by `uv sync`. Run `uv run browser-harness --doctor` if it needs connecting. Allow remote debugging in Chrome when prompted.
 
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current demo uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper; configure the appropriate model, endpoint, and reasoning setting.
+
+Decision calls go to `SYSTEMONE_BASE_URL`, which defaults to TypeSafe's hosted endpoint. Any server exposing the same `/v1/systemone` API works, including a local one such as `http://127.0.0.1:8011/v1`; leave `TYPESAFE_API_KEY` empty when that server needs no credentials. The text helper is independent and can also run locally, for example an Ollama endpoint at `http://127.0.0.1:11434/v1`.
+
+When the local model is unsure about a field, `THINKING_CONFIDENCE_THRESHOLD` (0.7 by default, matching the checkpoint's own thinking threshold) hands that one field to the text helper, which chooses again from the same options and the same state. This is the checkpoint's thinking handoff, run by the client instead of the server. Below the threshold a small model reads a half-finished page as finished and an unfinished one as finished too, so the handoff is what keeps a run honest. A failed handoff keeps the local answer. Set the threshold to 0 to skip it.
 
 ## Use the library
 

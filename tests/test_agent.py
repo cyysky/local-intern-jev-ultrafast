@@ -140,6 +140,139 @@ def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch
     assert d["choice"] == "e3"
 
 
+def test_local_systemone_needs_no_credential_and_reports_provider_errors(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setenv("SYSTEMONE_BASE_URL", "http://127.0.0.1:8011/v1/")
+    monkeypatch.setenv("MODEL_TIMEOUT_SECONDS", "300")
+    sent = {}
+
+    def post(url, json, headers, timeout):
+        sent.update(url=url, headers=headers, timeout=timeout)
+        return Mock(is_error=True, status_code=422, json=lambda: {"error": {"message": "at most 62 options"}})
+
+    monkeypatch.setattr(model, "CLIENT", Mock(post=post))
+    assert model.systemone_url() == "http://127.0.0.1:8011/v1/systemone"
+    with pytest.raises(RuntimeError, match="at most 62 options"):
+        model.post_json(model.systemone_url(), "", {})
+    assert sent["headers"] == {} and sent["timeout"] == 300.0
+
+
+def test_choose_posts_to_the_configured_systemone_endpoint(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setenv("SYSTEMONE_BASE_URL", "http://127.0.0.1:8011/v1")
+    calls = []
+
+    def post(url, key, body):
+        calls.append((url, key))
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                "click_target": choice(body["questions"]["click_target"]["criteria"], "2"),
+            },
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Find a book", [])
+    assert calls == [("http://127.0.0.1:8011/v1/systemone", "")]
+    assert d["choice"] == "e3"
+
+
+def stopping_answers(operations, confidence, others):
+    """A DONE head alongside weaker, distinct heads that sum to one."""
+    assert set(operations) == {"DONE", *others}
+    probabilities = {"DONE": confidence, **others}
+    assert abs(sum(probabilities.values()) - 1) < 1e-9
+    return {
+        "model": "test",
+        "answers": {
+            "operation": {"choice": "DONE", "confidence": confidence, "probabilities": probabilities},
+            "click_target": choice(["1", "2"], "2"),
+        },
+    }
+
+
+WEAKER = {"CLICK": 0.3, "TYPE_TEXT": 0.16, "WAIT": 0.08, "BLOCKED": 0.04}
+
+
+def test_a_shaky_operation_is_handed_to_the_text_helper(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("THINKING_CONFIDENCE_THRESHOLD", "0.7")
+    helper_calls, sent = [], {}
+
+    def post(url, key, body):
+        if url.endswith("/systemone"):
+            sent.update(body)
+            operations = body["questions"]["operation"]["criteria"]
+            return stopping_answers(operations, 0.42, WEAKER)
+        helper_calls.append((url, key, body))
+        return {"choices": [{"message": {"content": json.dumps({"choice": "CLICK"})}}], "usage": {}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Find a book", [])
+    assert d["operation"] == "CLICK" and d["choice"] == "e3"
+    assert [record["field"] for record in d["thinking"]] == ["operation"]
+    url, key, body = helper_calls[0]
+    assert url == "https://api.deepseek.com/v1/chat/completions" and key == "test"
+    payload = json.loads(body["messages"][1]["content"])
+    assert payload["field"] == "operation" and payload["state"] == sent["state"]
+    assert set(payload["allowed_options"]) == set(sent["questions"]["operation"]["criteria"])
+
+
+def test_a_confident_operation_is_not_handed_to_the_text_helper(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("THINKING_CONFIDENCE_THRESHOLD", "0.7")
+
+    def post(url, _key, _body):
+        assert url.endswith("/systemone"), "the helper must not be called"
+        return stopping_answers(
+            _body["questions"]["operation"]["criteria"],
+            0.95,
+            {"CLICK": 0.03, "TYPE_TEXT": 0.01, "WAIT": 0.007, "BLOCKED": 0.003},
+        )
+
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Find a book", [])
+    assert d["operation"] == "DONE" and d["choice"] == "DONE" and d["thinking"] == []
+
+
+def test_a_shaky_target_is_handed_to_the_text_helper(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("THINKING_CONFIDENCE_THRESHOLD", "0.7")
+    fields = []
+
+    def post(url, _key, body):
+        if url.endswith("/systemone"):
+            return {
+                "model": "test",
+                "answers": {
+                    "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
+                    "click_target": {"choice": "1", "confidence": 0.65, "probabilities": {"1": 0.65, "2": 0.35}},
+                },
+            }
+        fields.append(json.loads(body["messages"][1]["content"])["field"])
+        return {"choices": [{"message": {"content": json.dumps({"choice": "2"})}}], "usage": {}}
+
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Find a book", [])
+    assert fields == ["click_target"] and d["target"] == "2" and d["choice"] == "e3"
+    assert [record["field"] for record in d["thinking"]] == ["click_target"]
+
+
+def test_a_failing_helper_keeps_the_local_answer(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("THINKING_CONFIDENCE_THRESHOLD", "0.7")
+
+    def post(url, _key, body):
+        if url.endswith("/systemone"):
+            return stopping_answers(body["questions"]["operation"]["criteria"], 0.42, WEAKER)
+        raise RuntimeError("helper is down")
+
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(page(), "Find a book", [])
+    assert d["operation"] == "DONE" and d["choice"] == "DONE" and d["thinking"] == []
+
+
 def test_quoted_task_text_still_uses_the_llm(monkeypatch):
     monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
     post = Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
@@ -318,3 +451,101 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "{'code': -32602, 'message': 'No target with given id found'}",
+        "{'code': -32001, 'message': 'Session with given id not found.'}",
+    ],
+)
+def test_a_tab_that_is_gone_is_named_as_such(message):
+    import jev_ultrafast.browser as browser
+
+    assert browser.is_gone(RuntimeError(message))
+    assert issubclass(browser.Gone, StalePage)
+
+
+def test_an_ordinary_cdp_error_is_not_gone():
+    import jev_ultrafast.browser as browser
+
+    assert not browser.is_gone(RuntimeError("Page.captureScreenshot timed out after 30s"))
+
+
+def test_closing_a_tab_chrome_already_closed_is_not_an_error(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    b = browser.Browser.__new__(browser.Browser)
+    b.target, b.session = "gone-target", "gone-session"
+    cdp = Mock(side_effect=RuntimeError("{'code': -32602, 'message': 'No target with given id found'}"))
+    monkeypatch.setattr(browser, "cdp", cdp)
+    b.close()
+    assert b.target is None and b.session is None
+    cdp.assert_called_once_with("Target.closeTarget", targetId="gone-target")
+
+
+def test_closing_a_live_tab_still_reports_a_real_failure(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    b = browser.Browser.__new__(browser.Browser)
+    b.target, b.session = "live-target", "live-session"
+    cdp = Mock(side_effect=RuntimeError("the daemon is not running"))
+    monkeypatch.setattr(browser, "cdp", cdp)
+    with pytest.raises(RuntimeError, match="daemon is not running"):
+        b.close()
+    assert b.target is None
+
+
+def test_observation_after_the_tab_is_gone_reopens_the_page(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    b = browser.Browser.__new__(browser.Browser)
+    b.session = "gone-session"
+    b.url = "https://example.test/"
+    reopened, observed = [], []
+
+    def reopen():
+        reopened.append(True)
+        b.session = "fresh-session"
+
+    def operation(request):
+        if request["session"] == "gone-session":
+            raise browser.Gone("Session with given id not found.")
+        observed.append(request["session"])
+        return {"url": "https://example.test/step", "actions": [], "screenshot": "x"}
+
+    monkeypatch.setattr(b, "reopen", reopen)
+    monkeypatch.setattr(browser, "browser_operation", operation)
+    monkeypatch.setattr(browser, "warm_frame", Mock())
+    info = b.observe(screenshot=True)
+    assert reopened == [True]
+    assert observed == ["fresh-session"]
+    assert b.url == "https://example.test/step"
+    assert info["url"] == "https://example.test/step"
+
+
+def test_a_capture_that_arrives_never_asks_for_the_front(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    calls = []
+    monkeypatch.setattr(browser, "cdp", lambda method, **params: calls.append(method) or {"data": "frame"})
+    assert browser.capture_frame("session") == "frame"
+    assert calls == ["Page.captureScreenshot"]
+
+
+def test_a_capture_asks_for_the_front_only_when_no_frame_arrives(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    calls = []
+
+    def cdp(method, **params):
+        if method == "Page.captureScreenshot" and method not in calls:
+            calls.append(method)
+            raise TimeoutError("Page.captureScreenshot timed out after 30s waiting for the daemon")
+        calls.append(method)
+        return {"data": "frame"}
+
+    monkeypatch.setattr(browser, "cdp", cdp)
+    assert browser.capture_frame("session") == "frame"
+    assert calls == ["Page.captureScreenshot", "Page.bringToFront", "Page.captureScreenshot"]

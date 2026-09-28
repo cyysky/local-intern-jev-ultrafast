@@ -132,6 +132,7 @@ class Agent:
                     "text_latency_ms": helper["latency_ms"] if helper else 0,
                     "operation": decision["operation"],
                     "target": decision["target"],
+                    "thinking": decision.get("thinking", []),
                     "page_changed": None,
                     "url": page["url"],
                     "usage": decision["usage"],

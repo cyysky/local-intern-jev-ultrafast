@@ -10,30 +10,84 @@ from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
+
+# Chrome composites a background tab only when a capture asks it to, and the
+# capture that asks can be dropped before a frame exists. A short discarded
+# capture warms the frame; the real one then has a budget worth waiting for.
+FRAME_WARMUP_SECONDS = 1.0
+SCREENSHOT_TIMEOUT_SECONDS = 30.0
 
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+GONE_MESSAGES = ("no target with given id", "session with given id not found", "no session with given id")
+
+
+class Gone(StalePage):
+    """The tab, or the session, this run was using no longer exists.
+
+    Chrome closes a background tab on its own, and the daemon can restart under
+    a run that outlives it. Either leaves the ids dangling, and every later call
+    then reports them as gone rather than as a page that merely changed.
+    """
+
+
+def is_gone(error):
+    """True when Chrome reports a target or session that is no longer there."""
+    message = str(error).lower()
+    return any(text in message for text in GONE_MESSAGES)
+
+
+def session_call(session, method, **params):
+    """One CDP call on one tab, with a tab that is gone named as such."""
+    try:
+        return cdp(method, session_id=session, **params)
+    except RuntimeError as error:
+        if is_gone(error):
+            raise Gone(str(error)) from None
+        raise
+
+
 class Browser:
     def __init__(self, url):
         ensure_daemon()
+        self.url = url
+        self.target = None
+        self.session = None
+        self.attach()
+        self.navigate()
+
+    def attach(self):
+        """Open an owned tab and attach one flattened session to it."""
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
-        self.call("Page.navigate", url=url)
+
+    def navigate(self):
+        self.call("Page.navigate", url=self.url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if self.evaluate("document.readyState") == "complete":
                 break
             time.sleep(0.02)
 
+    def reopen(self):
+        """Replace a tab that is gone with a fresh one on the same page.
+
+        Nothing observed survives the old tab, so the run is put back on the page
+        it was reading and observation is retried there.
+        """
+        self.detach()
+        self.attach()
+        self.navigate()
+
     def call(self, method, **params):
-        return cdp(method, session_id=self.session, **params)
+        return session_call(self.session, method, **params)
 
     def evaluate(self, expression):
         response = self.call("Runtime.evaluate", expression=expression, returnByValue=True)
@@ -42,6 +96,8 @@ class Browser:
         return response.get("result", {}).get("value")
 
     def observe(self, screenshot=True):
+        if screenshot:
+            warm_frame(self.session)
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             # This is read-only and happens after execution was logged, even if navigation interrupts it.
@@ -72,17 +128,26 @@ class Browser:
                     awaitPromise=True,
                     returnByValue=True,
                 )
-            except RuntimeError:
+            except (Gone, RuntimeError, TimeoutError):
                 pass
         for attempt in range(10):
             try:
-                return browser_operation(
+                info = browser_operation(
                     {"operation": "observe", "session": self.session, "screenshot": screenshot}
                 )
+            except Gone:
+                # The tab is gone, so nothing observed survives it. Put the run
+                # back on the page it was reading and observe there.
+                self.reopen()
+                if screenshot:
+                    warm_frame(self.session)
+                continue
             except StalePage:
                 if attempt == 9:
                     raise
                 time.sleep(0.02)
+            self.url = info["url"]
+            return info
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
@@ -107,9 +172,22 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        self.detach()
+
+    def detach(self):
+        """Release the owned tab. One Chrome already closed is not an error.
+
+        A daemon that restarted reports the same thing, and both mean the tab
+        this run wanted released is already gone.
+        """
+        target, self.target, self.session = self.target, None, None
+        if not target:
+            return
+        try:
+            cdp("Target.closeTarget", targetId=target)
+        except RuntimeError as error:
+            if not is_gone(error):
+                raise
 
 
 def fingerprint(state):
@@ -117,12 +195,58 @@ def fingerprint(state):
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
+def warm_frame(session):
+    """Ask Chrome for a frame and throw it away.
+
+    The capture that triggers compositing in a background tab is the one that gets
+    dropped, so the caller's real capture would otherwise wait out its whole
+    timeout for a frame it has already paid for.
+    """
+    try:
+        cdp(
+            "Page.captureScreenshot",
+            session_id=session,
+            format="jpeg",
+            quality=72,
+        _response_timeout=FRAME_WARMUP_SECONDS,
+    )
+    except (RuntimeError, TimeoutError):
+        pass
+
+
+def capture_frame(session):
+    """Capture one frame, and ask for the front only when none arrives.
+
+    A window whose tabs are all in the background can stop compositing
+    altogether, and then every capture waits out its whole timeout for a frame
+    that never comes. Asking for the front makes that window composite again.
+    The tab pays it once; captures after that stay in the background.
+    """
+    try:
+        return cdp(
+            "Page.captureScreenshot",
+            session_id=session,
+            format="jpeg",
+            quality=72,
+            _response_timeout=SCREENSHOT_TIMEOUT_SECONDS,
+        )["data"]
+    except (RuntimeError, TimeoutError):
+        cdp("Page.bringToFront", session_id=session)
+        return cdp(
+            "Page.captureScreenshot",
+            session_id=session,
+            format="jpeg",
+            quality=72,
+            _response_timeout=SCREENSHOT_TIMEOUT_SECONDS,
+        )["data"]
+
+
 def browser_operation(request):
     operation = request["operation"]
     session = request["session"]
 
     def call(method, **params):
-        return cdp(method, session_id=session, **params)
+        return session_call(session, method, **params)
 
     def evaluate(expression):
         result = call("Runtime.evaluate", expression=expression, returnByValue=True)
@@ -190,5 +314,6 @@ def browser_operation(request):
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)
     if request.get("screenshot", True):
-        info["screenshot"] = call("Page.captureScreenshot", format="jpeg", quality=72)["data"]
+        warm_frame(session)
+        info["screenshot"] = capture_frame(session)
     return info

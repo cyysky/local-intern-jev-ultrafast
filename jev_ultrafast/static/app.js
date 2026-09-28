@@ -9,6 +9,11 @@ const goals = {
   research:
     "Open the article about using finite choices to control browser agents.",
 };
+const pages = {
+  flights: 'https://www.google.com/travel/flights?hl=en',
+  travel: `${location.origin}/fixture.html?scenario=travel`,
+  research: `${location.origin}/fixture.html?scenario=research`,
+};
 const escape = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -35,6 +40,7 @@ function controls() {
   $("start").disabled = busy;
   $("scenario").disabled = busy;
   $("goal").disabled = busy;
+  $("url").disabled = busy;
   $("choose").disabled = busy || !live;
   $("execute").disabled = busy || !state?.decision || !live;
   $("auto").disabled = busy || !live;
@@ -68,7 +74,13 @@ async function perform(fn, label) {
 }
 function render() {
   if (!state) return;
-  $("helper").textContent = `Text helper · ${state.text_model}`;
+  $("helper").textContent = `Text helper · ${state.text_model}${
+    state.text_endpoint ? ` @ ${state.text_endpoint}` : ""
+  }`;
+  $("decision-model").textContent = state.decision_model || "jev-latest";
+  $("model-endpoint").textContent = state.decision_endpoint
+    ? `${state.decision_endpoint} · + text helper`
+    : "+ text helper";
   $("plan").innerHTML = (state.plan || [])
     .map(
       (goal, i) =>
@@ -94,7 +106,7 @@ function render() {
   $("empty").hidden = true;
   $("screenshot").hidden = false;
   $("screenshot").src = `data:image/jpeg;base64,${page.screenshot}`;
-  $("url").textContent = page.url;
+  $("page-url").textContent = page.url;
   $("page-title").textContent = page.title;
   $("action-count").textContent = `${state.elements.length} elements`;
   const chosen = page.actions.find((a) => a.id === d?.choice);
@@ -104,6 +116,15 @@ function render() {
   $("latency").textContent = d ? `${d.latency_ms} ms` : "—";
   $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "—";
   $("completion").textContent = d ? d.operation : "—";
+  const deliberated = d?.thinking || [];
+  $("helper-note").hidden = !deliberated.length;
+  if (deliberated.length)
+    $("helper-note").textContent = deliberated
+      .map(
+        (t) =>
+          `Text helper chose ${t.choice} for ${t.field} · the local model said ${t.local} at ${percent(t.local_probability)}`,
+      )
+      .join(" · ");
   $("ranking-note").textContent = d ? "Ranked by Jev" : "Unranked";
   const op = Object.entries(d?.operation_probabilities || {}).sort((a,b)=>b[1]-a[1]);
   $("operation-choices").innerHTML = op.map(([name,p]) =>
@@ -150,13 +171,19 @@ $("task-form").addEventListener("submit", (event) => {
   automatic = false;
   perform(
     () =>
-      call("reset", { scenario: $("scenario").value, goal: $("goal").value }),
+      call("reset", {
+        scenario: $("scenario").value,
+        goal: $("goal").value,
+        url: $("url").value,
+      }),
     "Opening a fresh browser…",
   );
 });
 $("scenario").addEventListener("change", () => {
   $("goal").value = goals[$("scenario").value];
+  $("url").placeholder = pages[$("scenario").value];
 });
+$("url").placeholder = pages[$("scenario").value];
 $("choose").addEventListener("click", () =>
   perform(() => call("predict"), "Jev is comparing the actions…"),
 );

@@ -25,7 +25,10 @@
             <a href="/demo.mp4" target="_blank" rel="noopener">Watch the real Google Flights run ↗</a>
           </p>
         </div>
-        <div class="model-tag">jev-latest <span>+ text helper</span></div>
+        <div class="model-tag">
+          <span class="model-name" id="decision-model">jev-latest</span>
+          <span id="model-endpoint">+ text helper</span>
+        </div>
       </section>
       <form id="task-form">
         <div class="task-label">
@@ -35,6 +38,16 @@
             <option value="travel">Travel planner · fixture</option>
             <option value="research">Reading room · fixture</option>
           </select>
+        </div>
+        <div class="task-row">
+          <input
+            id="url"
+            name="url"
+            type="url"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="Leave blank for the scenario page, or paste any http(s) URL"
+          />
         </div>
         <div class="task-row">
           <textarea id="goal" name="goal" rows="5">
@@ -64,7 +77,7 @@ Find one-way flights from Zurich to London on September 20, 2026, for one adult 
         <div class="browser-panel">
           <div class="browser-bar">
             <div class="traffic"><b></b><b></b><b></b></div>
-            <span id="url">Local demo browser</span
+            <span id="page-url">Local demo browser</span
             ><span class="live">LIVE</span>
           </div>
           <div class="viewport" id="viewport">
@@ -97,6 +110,7 @@ Find one-way flights from Zurich to London on September 20, 2026, for one adult 
             <span id="action-count">0 options</span>
           </div>
           <div id="plan" class="plan"></div>
+          <p id="helper-note" class="helper-note" hidden></p>
           <div class="metrics">
             <div><span>Decision time</span><strong id="latency">—</strong></div>
             <div>

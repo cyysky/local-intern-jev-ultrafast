@@ -23,15 +23,28 @@ AGENT = None
 def load_environment():
     path = Path.cwd() / ".env"
     if path.exists():
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)
                 os.environ.setdefault(key, value)
 
 
+def model_endpoint(name, default):
+    """Host:port of a configured model server, for the UI."""
+    base = os.environ.get(name, default)
+    return urlparse(base).netloc or base
+
+
 def response_state():
     state = AGENT.snapshot() if AGENT else {"page": None, "status": "idle", "history": [], "decision": None}
-    return {**state, "text_model": os.environ.get("TEXT_MODEL", "deepseek-chat"), "max_steps": MAX_STEPS}
+    return {
+        **state,
+        "text_model": os.environ.get("TEXT_MODEL", "deepseek-chat"),
+        "text_endpoint": model_endpoint("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1"),
+        "decision_model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
+        "decision_endpoint": model_endpoint("SYSTEMONE_BASE_URL", "https://api.typesafe.ai/v1"),
+        "max_steps": MAX_STEPS,
+    }
 
 
 def close_browser():
@@ -50,11 +63,17 @@ def command(name, body):
         goal = body.get("goal", "").strip()
         if not goal or len(goal) > 2000:
             raise ValueError("Enter 1–2,000 characters")
+        url = body.get("url", "").strip()
+        if url and not url.startswith(("http://", "https://")):
+            raise ValueError("The URL must start with http:// or https://")
         close_browser()
         AGENT = Agent(
-            "https://www.google.com/travel/flights?hl=en"
-            if scenario == "flights"
-            else f"{ORIGIN}/fixture.html?scenario={scenario}",
+            url
+            or (
+                "https://www.google.com/travel/flights?hl=en"
+                if scenario == "flights"
+                else f"{ORIGIN}/fixture.html?scenario={scenario}"
+            ),
             goal,
             screenshots=True,
             record_dir=Path.cwd() / "artifacts" / "frames" if body.get("record") else None,
@@ -98,7 +117,9 @@ class Handler(BaseHTTPRequestHandler):
         if path not in files:
             return self.send(404, "Not found", "text/plain")
         name, mime = files[path]
-        content = (ROOT / "static" / name).read_text().replace("__TOKEN__", TOKEN)
+        # The pages are UTF-8, but Path.read_text defaults to the locale encoding
+        # (cp1252 on Windows), which raises on any non-ASCII byte.
+        content = (ROOT / "static" / name).read_text(encoding="utf-8").replace("__TOKEN__", TOKEN)
         self.send(200, content, mime + "; charset=utf-8")
 
     def do_POST(self):
